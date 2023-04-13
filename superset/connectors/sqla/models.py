@@ -17,6 +17,7 @@
 # pylint: disable=too-many-lines
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import logging
@@ -65,6 +66,7 @@ from sqlalchemy import (
     Table,
     Text,
     update,
+    nullslast
 )
 from sqlalchemy.engine.base import Connection
 from sqlalchemy.ext.hybrid import hybrid_property
@@ -1193,6 +1195,17 @@ class SqlaTable(Model, BaseDatasource):  # pylint: disable=too-many-public-metho
             "to_dttm": to_dttm.isoformat() if to_dttm else None,
             "table_columns": [col.column_name for col in self.columns],
             "filter": filter,
+            "is_timeseries": is_timeseries,
+            "is_rowcount": is_rowcount,
+            "inner_from_dttm": inner_from_dttm,
+            "inner_to_dttm": inner_to_dttm,
+            "series_limit": series_limit,
+            "series_limit_metric": series_limit_metric,
+            "timeseries_limit": timeseries_limit,
+            "timeseries_limit_metric": timeseries_limit_metric,
+            "extras": extras,
+            "table_name": self.table_name,
+            "orderby": orderby,
         }
         columns = columns or []
         groupby = groupby or []
@@ -1649,15 +1662,15 @@ class SqlaTable(Model, BaseDatasource):  # pylint: disable=too-many-public-metho
                     schema=self.schema,
                 )
                 having_clause_and += [self.text(having)]
-
-        if apply_fetch_values_predicate and self.fetch_values_predicate:
-            qry = qry.where(
-                self.get_fetch_values_predicate(template_processor=template_processor)
-            )
-        if granularity:
-            qry = qry.where(and_(*(time_filters + where_clause_and)))
-        else:
-            qry = qry.where(and_(*where_clause_and))
+        if self.table_name != "metrics":
+            if apply_fetch_values_predicate and self.fetch_values_predicate:
+                qry = qry.where(
+                    self.get_fetch_values_predicate(template_processor=template_processor)
+                )
+            if granularity:
+                qry = qry.where(and_(*(time_filters + where_clause_and)))
+            else:
+                qry = qry.where(and_(*where_clause_and))
         qry = qry.having(and_(*having_clause_and))
 
         self.make_orderby_compatible(select_exprs, orderby_exprs)
@@ -1675,7 +1688,11 @@ class SqlaTable(Model, BaseDatasource):  # pylint: disable=too-many-public-metho
             ):
                 col = literal_column(col.name)
             direction = asc if ascending else desc
-            qry = qry.order_by(direction(col))
+            if self.db_engine_spec.engine.lower() == "bigquery":
+                if self.table_name != "metrics":
+                    qry = qry.order_by(nullslast(direction(col)))
+            else:
+                qry = qry.order_by(nullslast(direction(col)))
 
         if row_limit:
             qry = qry.limit(row_limit)
@@ -1699,7 +1716,15 @@ class SqlaTable(Model, BaseDatasource):  # pylint: disable=too-many-public-metho
                     inner_select_exprs.append(inner)
 
                 inner_select_exprs += [inner_main_metric_expr]
-                subq = select(inner_select_exprs).select_from(tbl)
+                if self.table_name == 'metrics':
+                    sl_template_kwargs = copy.deepcopy(template_kwargs)
+                    sl_template_kwargs['has_series_limit'] = True
+                    template_processor_tmp_sl = self.get_template_processor(**sl_template_kwargs)
+                    tbl_sl, cte_sl = self.get_from_clause(template_processor_tmp_sl)
+
+                    subq = select(inner_select_exprs).select_from(tbl_sl)
+                else:
+                    subq = select(inner_select_exprs).select_from(tbl)
                 inner_time_filter = []
 
                 if dttm_col and not db_engine_spec.time_groupby_inline:
@@ -1710,7 +1735,8 @@ class SqlaTable(Model, BaseDatasource):  # pylint: disable=too-many-public-metho
                             template_processor=template_processor,
                         )
                     ]
-                subq = subq.where(and_(*(where_clause_and + inner_time_filter)))
+                if self.table_name != 'metrics':
+                    subq = subq.where(and_(*(where_clause_and + inner_time_filter)))
                 subq = subq.group_by(*inner_groupby_exprs)
 
                 ob = inner_main_metric_expr
@@ -1774,7 +1800,8 @@ class SqlaTable(Model, BaseDatasource):  # pylint: disable=too-many-public-metho
                 top_groups = self._get_top_groups(
                     result.df, dimensions, groupby_series_columns, columns_by_name
                 )
-                qry = qry.where(top_groups)
+                if self.table_name != "metrics":
+                    qry = qry.where(top_groups)
 
         qry = qry.select_from(tbl)
 
