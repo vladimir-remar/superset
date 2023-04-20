@@ -61,7 +61,12 @@ class SqlQueryRenderImpl(SqlQueryRender):
             rendered_query = sql_template_processor.process_template(
                 query_model.sql, **execution_context.template_params
             )
-            self._validate(execution_context, rendered_query, sql_template_processor)
+            # self._validate(execution_context, rendered_query, sql_template_processor)
+            table_name = getattr(sql_template_processor, "table_name", None)
+            if table_name and table_name == "metrics":
+                rendered_query = sql_template_processor.process_custom_parsed_query(rendered_query)
+            else:
+                self._validate(execution_context, rendered_query, sql_template_processor)
             return rendered_query
         except TemplateError as ex:
             self._raise_template_exception(ex, execution_context)
