@@ -63,7 +63,8 @@ class SqlQueryRenderImpl(SqlQueryRender):
             )
             # self._validate(execution_context, rendered_query, sql_template_processor)
             table_name = getattr(sql_template_processor, "table_name", None)
-            if table_name and table_name == "metrics":
+            dbt_cloud = getattr(sql_template_processor, "dbt_cloud", None)
+            if table_name and table_name == "metrics" and dbt_cloud:
                 rendered_query = sql_template_processor.process_custom_parsed_query(rendered_query)
             else:
                 self._validate(execution_context, rendered_query, sql_template_processor)
