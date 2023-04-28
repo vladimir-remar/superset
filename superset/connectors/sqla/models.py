@@ -22,6 +22,7 @@ import dataclasses
 import json
 import logging
 import re
+from os import environ
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -1971,6 +1972,31 @@ class SqlaTable(Model, BaseDatasource):  # pylint: disable=too-many-public-metho
                 dataclasses.asdict(error) for error in db_engine_spec.extract_errors(ex)
             ]
             error_message = utils.error_msg_from_exception(ex)
+
+            # dbt cloud error handler
+            error = error_message
+            dbt_cloud = bool(environ.get("DBT_CLOUD", 0))
+            if self.table_name == "metrics" and dbt_cloud:
+                if "The dimension" in error and "is not part of the metric" in error:
+                    pattern = re.compile(r"The dimension(.*?)>")
+                    matches = pattern.findall(error)
+                    error_text = ''
+                    for index, match in enumerate(matches):
+                        if index == 0:
+                            error_text += f'''The dimension {match.strip()}'''
+                        else:
+                            error_text += f''' and the dimension {match.strip()}'''
+                    raise Exception("{}".format(error_text))
+                elif "The metric" in error and "does not have the provided time grain" in error and "defined in the metric definition." in error:
+                    pattern = re.compile(r"The metric(.*?)defined in the metric definition.")
+                    matches = pattern.findall(error)
+                    error_text = ''
+                    for index, match in enumerate(matches):
+                        if index == 0:
+                            error_text += f'''The metric {match.strip()} defined in the metric definition'''
+                        else:
+                            error_text += f''' and the metric {match.strip()} defined in the metric definition'''
+                    raise Exception("{}".format(error_text))
 
         return QueryResult(
             applied_template_filters=query_str_ext.applied_template_filters,
