@@ -1207,6 +1207,7 @@ class SqlaTable(Model, BaseDatasource):  # pylint: disable=too-many-public-metho
             "extras": extras,
             "table_name": self.table_name,
             "orderby": orderby,
+            "database_id": self.database_id,
         }
         columns = columns or []
         groupby = groupby or []
