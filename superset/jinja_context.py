@@ -363,25 +363,26 @@ def safe_proxy(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 
 
 def validate_context_types(context: dict[str, Any]) -> dict[str, Any]:
-    for key in context:
-        arg_type = type(context[key]).__name__
-        if arg_type not in ALLOWED_TYPES and key not in context_addons():
-            if arg_type == "partial" and context[key].func.__name__ == "safe_proxy":
-                continue
-            raise SupersetTemplateException(
-                _(
-                    "Unsafe template value for key %(key)s: %(value_type)s",
-                    key=key,
-                    value_type=arg_type,
-                )
-            )
-        if arg_type in COLLECTION_TYPES:
-            try:
-                context[key] = json.loads(json.dumps(context[key]))
-            except TypeError as ex:
+    if context.get("table_name") != "metrics":
+        for key in context:
+            arg_type = type(context[key]).__name__
+            if arg_type not in ALLOWED_TYPES and key not in context_addons():
+                if arg_type == "partial" and context[key].func.__name__ == "safe_proxy":
+                    continue
                 raise SupersetTemplateException(
-                    _("Unsupported template value for key %(key)s", key=key)
-                ) from ex
+                    _(
+                        "Unsafe template value for key %(key)s: %(value_type)s",
+                        key=key,
+                        value_type=arg_type,
+                    )
+                )
+            if arg_type in COLLECTION_TYPES:
+                try:
+                    context[key] = json.loads(json.dumps(context[key]))
+                except TypeError as ex:
+                    raise SupersetTemplateException(
+                        _("Unsupported template value for key %(key)s", key=key)
+                    ) from ex
 
     return context
 

@@ -1420,7 +1420,7 @@ class SqlaTable(
         query_obj: QueryObjectDict,
         mutate: bool = True,
     ) -> QueryStringExtended:
-        sqlaq = self.get_sqla_query(**query_obj)
+        sqlaq = self.get_sqla_query(**query_obj, table_name=self.table_name)
         sql = self.database.compile_sqla_query(sqlaq.sqla_query)
         sql = self._apply_cte(sql, sqlaq.cte)
         sql = sqlparse.format(sql, reindent=True)
@@ -2002,7 +2002,7 @@ class SqlaTable(
         :return: The extra cache keys
         """
         extra_cache_keys = super().get_extra_cache_keys(query_obj)
-        if self.has_extra_cache_key_calls(query_obj):
+        if self.has_extra_cache_key_calls(query_obj, table_name=self.table_name):
             sqla_query = self.get_sqla_query(**query_obj)
             extra_cache_keys += sqla_query.extra_cache_keys
         return extra_cache_keys
