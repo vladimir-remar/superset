@@ -174,6 +174,14 @@ def get_since_until(  # pylint: disable=too-many-arguments,too-many-locals,too-m
         - Next X seconds/minutes/hours/days/weeks/months/years
 
     """
+    print("===========================get_since_until===========================")
+    print("time_range: ", time_range)
+    print("since: ", since)
+    print("until: ", until)
+    print("time_shift: ", time_shift)
+    print("relative_start: ", relative_start)
+    print("relative_end: ", relative_end)
+    print("=====================================================================")
     separator = " : "
     _relative_start = relative_start if relative_start else "today"
     _relative_end = relative_end if relative_end else "today"
