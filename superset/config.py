@@ -59,6 +59,9 @@ from superset.utils.core import is_test, NO_TIME_RANGE, parse_boolean_string
 from superset.utils.encrypt import SQLAlchemyUtilsAdapter
 from superset.utils.log import DBEventLogger
 from superset.utils.logging_configurator import DefaultLoggingConfigurator
+from superset.common.utils.time_range_utils import get_since_until_from_time_range
+from superset.jinja_context import BaseTemplateProcessor, validate_template_context
+
 
 logger = logging.getLogger(__name__)
 
@@ -420,7 +423,7 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     # make GET request to explore_json. explore_json accepts both GET and POST request.
     # See `PR 7935 <https://github.com/apache/superset/pull/7935>`_ for more details.
     "ENABLE_EXPLORE_JSON_CSRF_PROTECTION": False,  # deprecated
-    "ENABLE_TEMPLATE_PROCESSING": False,
+    "ENABLE_TEMPLATE_PROCESSING": True,
     "ENABLE_TEMPLATE_REMOVE_FILTERS": True,  # deprecated
     # Allow for javascript controls components
     # this enables programmers to customize certain charts (like the
@@ -1119,7 +1122,97 @@ JINJA_CONTEXT_ADDONS: dict[str, Callable[..., Any]] = {}
 # dictionary. The customized addons don't necessarily need to use Jinja templating
 # language. This allows you to define custom logic to process templates on a per-engine
 # basis. Example value = `{"presto": CustomPrestoTemplateProcessor}`
-CUSTOM_TEMPLATE_PROCESSORS: dict[str, type[BaseTemplateProcessor]] = {}
+# CUSTOM_TEMPLATE_PROCESSORS: dict[str, type[BaseTemplateProcessor]] = {}
+db_engine_spec: str = os.environ.get("db_engine_spec", "snowflake")
+
+def modify_context_for_custom_template_processors(context: dict[str, Any]) -> dict[str, Any]:
+    import datetime
+    filters = context['filter'].copy()
+    start_date = None
+    end_date = None
+    if filters != []:
+        for filter_ in filters:
+            filter_type = filter_.get("op")
+            if not filter_type:
+                continue
+            if filter_type.lower() == "temporal_range":
+                val = filter_['val']
+                if not val or val == 'No filter':
+                    continue
+                start_date, end_date = get_since_until_from_time_range(
+                    time_range=val,
+                    time_shift=None,
+                    extras=None,
+                )
+                dbt_start_date = None
+                dbt_end_date = None
+                if start_date is not None:
+                    dbt_start_date = start_date.strftime('%Y-%m-%dT%H:%M:%S')                    
+                if end_date is not None:
+                    dbt_end_date = end_date.strftime('%Y-%m-%dT%H:%M:%S')
+                
+                filter_['start_date_temporal_range'] = dbt_start_date
+                filter_['end_date_temporal_range'] = dbt_end_date
+        
+    context["db_engine_spec"] = db_engine_spec
+    context["filter"] = filters
+    # context
+
+    inner_from_dttm = context.get("inner_from_dttm")
+    inner_to_dttm = context.get("inner_to_dttm")
+    if inner_from_dttm:
+        if isinstance(inner_from_dttm, datetime.datetime):
+            context["inner_from_dttm"] = inner_from_dttm.strftime('%Y-%m-%dT%H:%M:%S')
+    if inner_to_dttm:
+        if isinstance(inner_to_dttm, datetime.datetime):
+            context["inner_to_dttm"] = inner_to_dttm.strftime('%Y-%m-%dT%H:%M:%S')
+
+    return context
+
+
+def get_dbt_compiled_query_from_saivo_backend(context: dict[str, Any]) -> str:
+    """Get the dbt compiled query."""
+    import requests
+    url = f"https://superset-dbt-sl.saivo.com/{client_name}/compile_sql"
+    response = requests.post(url, json=context)
+    data_parsed = response.json()
+    sql = data_parsed.get("sql")
+    response_type = data_parsed.get("response_type")
+    if response.status_code == 500:
+        raise Exception("{}".format(sql))
+    return sql
+
+class CustomTemplateProcessor(BaseTemplateProcessor):
+    """A custom presto template processor."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.table_name = "dbt_semantic_layer"
+
+    def process_template(self, sql: str, **kwargs) -> str:
+        """Processes a sql template with $ style macro using regex."""
+        # Add custom macros functions.
+        macros = {}  # type: Dict[str, Any]
+        # Update with macros defined in context and kwargs.
+        if self._context.get("table_name") == "dbt_semantic_layer":
+            self._context = modify_context_for_custom_template_processors(self._context)
+            print("=====================CONTEXT=====================")
+            print(self._context)
+            dbt_compiled_query = get_dbt_compiled_query_from_saivo_backend(self._context)
+            # self._context["orderby"] = []
+            macros["DBT_METRIC"] = dbt_compiled_query
+            # envio peti sl_backend
+        template = self._env.from_string(sql)
+        macros.update(self._context)
+        macros.update(kwargs)
+
+        context = validate_template_context(self.engine, macros)
+        return template.render(context)
+
+
+CUSTOM_TEMPLATE_PROCESSORS = {
+    db_engine_spec: CustomTemplateProcessor
+}
 
 # Roles that are controlled by the API / Superset and should not be changed
 # by humans.
