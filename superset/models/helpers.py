@@ -27,7 +27,7 @@ from collections.abc import Hashable
 from datetime import datetime, timedelta
 from json.decoder import JSONDecodeError
 from typing import Any, cast, NamedTuple, Optional, TYPE_CHECKING, Union
-
+import copy as python_copy
 import dateutil.parser
 import humanize
 import numpy as np
@@ -51,7 +51,7 @@ from sqlalchemy.sql.elements import ColumnElement, literal_column, TextClause
 from sqlalchemy.sql.expression import Label, Select, TextAsFrom
 from sqlalchemy.sql.selectable import Alias, TableClause
 from sqlalchemy_utils import UUIDType
-
+from sqlalchemy import nullslast
 from superset import app, db, is_feature_enabled, security_manager
 from superset.advanced_data_type.types import AdvancedDataTypeResponse
 from superset.common.db_query_status import QueryStatus
@@ -107,6 +107,7 @@ VIRTUAL_TABLE_ALIAS = "virtual_table"
 SERIES_LIMIT_SUBQ_ALIAS = "series_limit"
 ADVANCED_DATA_TYPES = config["ADVANCED_DATA_TYPES"]
 
+INIT = 0
 
 def validate_adhoc_subquery(
     sql: str,
@@ -1459,6 +1460,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         timeseries_limit: Optional[int] = None,
         timeseries_limit_metric: Optional[Metric] = None,
         time_shift: Optional[str] = None,
+        **kwargs: Any,
     ) -> SqlaQuery:
         """Querying any sqla table from this common interface"""
         if granularity not in self.dttm_cols and granularity is not None:
@@ -1466,6 +1468,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
 
         extras = extras or {}
         time_grain = extras.get("time_grain_sqla")
+        table_name = kwargs.get("table_name", "")
 
         template_kwargs = {
             "columns": columns,
@@ -1479,6 +1482,20 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             "to_dttm": to_dttm.isoformat() if to_dttm else None,
             "table_columns": [col.column_name for col in self.columns],
             "filter": filter,
+            "is_timeseries": is_timeseries,
+            "is_rowcount": is_rowcount,
+            "inner_from_dttm": inner_from_dttm,
+            "inner_to_dttm": inner_to_dttm,
+            "series_limit": series_limit,
+            "series_limit_metric": series_limit_metric,
+            "timeseries_limit": timeseries_limit,
+            "timeseries_limit_metric": timeseries_limit_metric,
+            "extras": extras,
+            "table_name": table_name,
+            "orderby": orderby,
+            "database_id": self.database_id,
+            "dttm_columns": [col.column_name for col in self.columns if col.is_dttm is True],
+
         }
         columns = columns or []
         groupby = groupby or []
@@ -1953,35 +1970,35 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     template_processor=template_processor,
                 )
                 having_clause_and += [self.text(having)]
-
-        if apply_fetch_values_predicate and self.fetch_values_predicate:
-            qry = qry.where(
-                self.get_fetch_values_predicate(template_processor=template_processor)
-            )
-        if granularity:
-            qry = qry.where(and_(*(time_filters + where_clause_and)))
-        else:
-            qry = qry.where(and_(*where_clause_and))
+        if table_name != "dbt_semantic_layer":
+            if apply_fetch_values_predicate and self.fetch_values_predicate:
+                qry = qry.where(
+                    self.get_fetch_values_predicate(template_processor=template_processor)
+                )
+            if granularity:
+                qry = qry.where(and_(*(time_filters + where_clause_and)))
+            else:
+                qry = qry.where(and_(*where_clause_and))
         qry = qry.having(and_(*having_clause_and))
 
         self.make_orderby_compatible(select_exprs, orderby_exprs)
+        if len(orderby) > 0:
+            for col, (orig_col, ascending) in zip(orderby_exprs, orderby):
+                if not db_engine_spec.allows_alias_in_orderby and isinstance(col, Label):
+                    # if engine does not allow using SELECT alias in ORDER BY
+                    # revert to the underlying column
+                    col = col.element
 
-        for col, (orig_col, ascending) in zip(orderby_exprs, orderby):
-            if not db_engine_spec.allows_alias_in_orderby and isinstance(col, Label):
-                # if engine does not allow using SELECT alias in ORDER BY
-                # revert to the underlying column
-                col = col.element
-
-            if (
-                db_engine_spec.get_allows_alias_in_select(self.database)
-                and db_engine_spec.allows_hidden_cc_in_orderby
-                and col.name in [select_col.name for select_col in select_exprs]
-            ):
-                with self.database.get_sqla_engine_with_context() as engine:
-                    quote = engine.dialect.identifier_preparer.quote
-                    col = literal_column(quote(col.name))
-            direction = sa.asc if ascending else sa.desc
-            qry = qry.order_by(direction(col))
+                if (
+                    db_engine_spec.get_allows_alias_in_select(self.database)
+                    and db_engine_spec.allows_hidden_cc_in_orderby
+                    and col.name in [select_col.name for select_col in select_exprs]
+                ):
+                    with self.database.get_sqla_engine_with_context() as engine:
+                        quote = engine.dialect.identifier_preparer.quote
+                        col = literal_column(quote(col.name))
+                direction = sa.asc if ascending else sa.desc
+                qry = qry.order_by(nullslast(direction(col)))
 
         if row_limit:
             qry = qry.limit(row_limit)
@@ -2004,7 +2021,16 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     inner_select_exprs.append(inner)
 
                 inner_select_exprs += [inner_main_metric_expr]
-                subq = sa.select(inner_select_exprs).select_from(tbl)
+                # subq = sa.select(inner_select_exprs).select_from(tbl)
+                if table_name == 'dbt_semantic_layer':
+                    sl_template_kwargs = python_copy.deepcopy(template_kwargs)
+                    sl_template_kwargs['has_series_limit'] = True
+                    template_processor_tmp_sl = self.get_template_processor(**sl_template_kwargs)
+                    tbl_sl, cte_sl = self.get_from_clause(template_processor_tmp_sl)
+
+                    subq = sa.select(inner_select_exprs).select_from(tbl_sl)
+                else:
+                    subq = sa.select(inner_select_exprs).select_from(tbl)
                 inner_time_filter = []
 
                 if dttm_col and not db_engine_spec.time_groupby_inline:
@@ -2016,7 +2042,9 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                             template_processor=template_processor,
                         )
                     ]
-                subq = subq.where(and_(*(where_clause_and + inner_time_filter)))
+                # subq = subq.where(and_(*(where_clause_and + inner_time_filter)))
+                if table_name != 'dbt_semantic_layer':
+                    subq = subq.where(and_(*(where_clause_and + inner_time_filter)))
                 subq = subq.group_by(*inner_groupby_exprs)
 
                 ob = inner_main_metric_expr
@@ -2080,7 +2108,9 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                 top_groups = self._get_top_groups(
                     result.df, dimensions, groupby_series_columns, columns_by_name
                 )
-                qry = qry.where(top_groups)
+                # qry = qry.where(top_groups)
+                if table_name != 'dbt_semantic_layer':
+                    qry = qry.where(top_groups)
 
         qry = qry.select_from(tbl)
 
