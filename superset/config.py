@@ -406,7 +406,7 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     # editor no longer shows. Currently this is set to false so that the editor
     # option does show, but we will be depreciating it.
     "DISABLE_LEGACY_DATASOURCE_EDITOR": True,
-    "ENABLE_TEMPLATE_PROCESSING": False,
+    "ENABLE_TEMPLATE_PROCESSING": True,
     # Allow for javascript controls components
     # this enables programmers to customize certain charts (like the
     # geospatial ones) by inputting javascript in controls. This exposes
@@ -1095,7 +1095,297 @@ JINJA_CONTEXT_ADDONS: dict[str, Callable[..., Any]] = {}
 # dictionary. The customized addons don't necessarily need to use Jinja templating
 # language. This allows you to define custom logic to process templates on a per-engine
 # basis. Example value = `{"presto": CustomPrestoTemplateProcessor}`
-CUSTOM_TEMPLATE_PROCESSORS: dict[str, type[BaseTemplateProcessor]] = {}
+# CUSTOM_TEMPLATE_PROCESSORS: dict[str, type[BaseTemplateProcessor]] = {}
+#==============================================================================
+import re
+import requests
+import os
+from collections import OrderedDict
+from datetime import datetime
+from functools import partial
+from datetime import timedelta
+from superset.jinja_context import BaseTemplateProcessor, validate_template_context
+from superset.common.utils.time_range_utils import get_since_until_from_time_range
+from superset.tasks.types import ExecutorType
+
+
+dbt_server_state_id: int = 3
+db_engine_spec: str = "snowflake"
+DBT_CLOUD = False
+DBT_SERVER = True
+
+def make_request_with_dimension(dimension):
+    client_name = os.environ.get("SAIVO_Vicio_RETOOL_ALIAS")
+    client_secret = os.environ.get("SAIVO_Vicio_RETOOL_SECRET")
+
+    url = "https://app.saivo.com/dimension_values"
+
+    params = {
+        "client_name": client_name,
+        "client_secret": client_secret,
+        "dimension": dimension
+    }
+
+    response = requests.get(url, params=params)
+    data = None
+    if response.status_code == 200:
+        data = response.json()
+    return data
+
+def create_sql_filters_from_dict_context(filters: list, context: dict) -> str:
+    
+    # Define all_filters variable:
+    all_filters = ''
+
+    # Add filters in case these are necessary:
+    dbt_conditions = {"==": '=', "!=": '!=', "IN": 'in', "NOT IN": 'not in', '>': '>', '<': '<', '>=': '>=', '<=': '<=', 'LIKE': 'like', 'ILIKE': 'like', 'IS NOT NULL': 'is not null', 'IS NULL': 'is null'}
+    if filters != [] or context['extras']['where']:
+        if context['extras']['where'] != '':
+            all_filters = all_filters + f'''{context['extras']['where']}'''
+        if filters != []:
+            for filter in filters:
+                union_word = ' and'
+                if all_filters == '':
+                    union_word = ''
+                if filter['op'] == 'IN' or filter['op'] == 'NOT IN':
+                    element = filter['val']
+                    elements = [ele if ele is not None else 'null' for ele in element]
+                    if len(filter['val']) == 1:
+                        filter_element = f'''('{elements[0]}')'''
+                        if elements == ['null']:
+                            filter_element = f'''({elements[0]})'''
+                    else:
+                        filter_element = tuple(elements)
+                        filter_element = "{}".format(filter_element).replace("'null'", "null")
+                    all_filters = all_filters + f"""{union_word} {filter['col'].lower()} {dbt_conditions[filter['op']]} {filter_element}"""
+                elif filter['op'] == '<' or filter['op'] == '>' or filter['op'] == '>=' or filter['op'] == '<=':
+                    all_filters = all_filters + f"""{union_word} {filter['col'].lower()} {dbt_conditions[filter['op']]} {filter['val']}"""
+                elif filter['op'] == '==' or filter['op'] == '!=':
+                    all_filters = all_filters + f"""{union_word} {filter['col'].lower()} {dbt_conditions[filter['op']]} '{filter['val']}'"""
+                elif filter['op'] == 'LIKE':
+                    all_filters = all_filters + f"""{union_word} {filter['col'].lower()} {dbt_conditions[filter['op']]} '{filter['val']}'"""
+                elif filter['op'] == 'ILIKE':
+                    all_filters = all_filters + f"""{union_word} lower({filter['col'].lower()}) {dbt_conditions[filter['op']]} lower('{filter['val']}')"""
+                elif filter['op'] == 'IS NOT NULL' or filter['op'] == 'IS NULL':
+                    all_filters = all_filters + f"""{union_word} {filter['col'].lower()} {dbt_conditions[filter['op']]}"""
+    
+    return all_filters
+
+def dbt_metric(context: dict) -> str:
+
+    # Get metrics:
+    metrics = context.get('metrics')
+    
+    # Get dimensions (these can happen in the groupby element or in columns):
+    columns_context = context.get("columns") or []
+    groupby_context = context.get("groupby") or []
+    columns = columns_context + groupby_context
+
+    # Stop in case we are asking dashboard filters (only one column):
+    if not metrics:
+        dashboard_filter_filters = create_sql_filters_from_dict_context(filters=context["filter"], context = context)
+        string_filters = make_request_with_dimension(columns[0])
+        if dashboard_filter_filters != '':
+            string_filters += f''' where {dashboard_filter_filters}'''
+        if not string_filters:
+            raise Exception(f"Values for this dimension {columns[0]} can not be previewed")
+        return string_filters
+
+    # Stop in case it is not a chart:
+    if not metrics and not columns:
+        return None
+
+    if not all(isinstance(e, str) for e in metrics):
+        return None
+
+    # Review this validation:
+    if not all(isinstance(e, (str, dict)) for e in columns):
+        return None
+
+    # Generate dbt_columns variable:
+    dbt_columns = []
+
+    # Find if it is a line chart with temporal axis or not:
+    x_axis_element = [item for item in columns if isinstance(item, dict)]
+    # dbt_grains = {"P1D": 'day', "P1W": 'week', "P1Y": 'year', 'P1M': 'month', 'P3M': 'quarter', '1969-12-29T00:00:00Z/P1W': 'week'}
+    dbt_grains = {"PT1M": 'minute', "PT1H": 'hour', "P1D": 'day', "P1W": 'week', "P1Y": 'year', 'P1M': 'month', 'P3M': 'quarter', '1969-12-29T00:00:00Z/P1W': 'week'}
+    is_time_series = None
+    if not len(x_axis_element):
+        print("No X axis found")
+    else:
+        if x_axis_element[0]["sqlExpression"].lower() == 'date':
+            is_time_series = True
+            time_grain = dbt_grains[x_axis_element[0]["timeGrain"]]
+        else:
+            is_time_series = False
+            dbt_columns.append(x_axis_element[0]["sqlExpression"].lower())
+        # Remove dict element:
+        columns.remove(x_axis_element[0])
+    if is_time_series is None:
+        if context['is_timeseries'] == True or "date" in columns or "__timestamp" in columns:
+            is_time_series = True
+            time_grain = dbt_grains[context['time_grain']]
+        else:
+            is_time_series = False
+    # Specify time grain and get start_date and end_date:
+    if context['is_timeseries'] == False and '__timestamp' not in columns and 'date' not in columns and not is_time_series:
+        time_grain = 'all_time'
+            
+
+    # Get metrics and columns considering the order by possibility :
+
+    orderby_text = None
+    orderby_metrics = []
+
+    if db_engine_spec == "bigquery":
+        if context['orderby'] != [] and context['orderby'] != None:
+            orderby_metrics = [context['orderby'][i][0] for i in range(len(context['orderby']))]
+            orderby_text = [context['orderby'][i][0] + " desc nulls last" if context['orderby'][i][1] == False else context['orderby'][i][0] + " asc nulls last" for i in range(len(context['orderby']))]
+            orderby_text = " ".join(orderby_text)
+    
+    # Get metrics and columns:
+    unique_metrics_list = list(OrderedDict.fromkeys((context["metrics"] + orderby_metrics)))
+    dbt_metrics = ['metric(\'' + col + '\')' for col in unique_metrics_list]
+    dbt_columns = dbt_columns + [col.lower() for col in columns if col.lower() not in ('__timestamp', 'date') or not isinstance(col, dict)]
+
+    # Create dbt code: # Create dbt code:
+    if time_grain == 'all_time':
+        sql = f"""select * from <<metrics.calculate({dbt_metrics}, dimensions={dbt_columns})>>"""
+    else:
+        sql = f"""select * from <<metrics.calculate({dbt_metrics}, grain='{time_grain}', dimensions={dbt_columns})>>"""
+    sql = sql.replace('"', '')
+
+    # Detect if we have a temporal range filter:
+    filters = context['filter'].copy()
+    start_date = None
+    end_date = None
+    if filters != []:
+        temporal_filter = [filter for filter in filters if filter['op'].lower() == 'temporal_range']
+        if len(temporal_filter) == 1:
+            if temporal_filter[0]['val'] != 'No filter':
+                val = temporal_filter[0]['val']
+                start_date, end_date = get_since_until_from_time_range(
+                    time_range=val,
+                    time_shift=None,
+                    extras=None,
+                )
+
+            filters.remove(temporal_filter[0])
+
+    # Add start_date and end_date in case these are necessary:
+    if start_date is not None:
+        # dbt_start_date = datetime.strptime(start_date, '%Y-%m-%d %H:%M:%S')
+        if db_engine_spec == "bigquery":
+            dbt_start_date = start_date.strftime('%Y-%m-%d')
+        else:
+            dbt_start_date = start_date.strftime('%Y-%m-%d %H:%M:%S')
+            
+        sql = sql[:-3] + f""", start_date = '{dbt_start_date}')>>"""
+                                
+    if end_date is not None:
+        # dbt_end_date = datetime.strptime(end_date, '%Y-%m-%d %H:%M:%S')
+        if db_engine_spec == "bigquery":
+            dbt_end_date = end_date.strftime('%Y-%m-%d')
+        else:
+            dbt_end_date = end_date.strftime('%Y-%m-%d %H:%M:%S')
+        sql = sql[:-3] + f""", end_date = '{dbt_end_date}')>>"""
+
+
+    # # Add filters in case these are necessary:
+    all_filters = create_sql_filters_from_dict_context(filters, context=context)
+    if all_filters != '':
+        sql = sql[:-3] + f""", where = "{all_filters}")>>"""
+
+    sql = sql.replace("<<", "{{").replace(">>", "}}")
+    
+    url = "http://0.0.0.0:8580/compile"
+    sql_obj = {'sql': sql, 'state_id': dbt_server_state_id}
+    response = requests.post(url, json=sql_obj)
+    parsed_response = response.json()
+    if response.status_code != 200:
+        error = parsed_response.get("message")
+        if "The dimension" in error and "is not part of the metric" in error:
+            pattern = re.compile(r"The dimension(.*?)>")
+            matches = pattern.findall(error)
+            error_text = ''
+            for index, match in enumerate(matches):
+                if index == 0:
+                    error_text += f'''The dimension {match.strip()}'''
+                else:
+                    error_text += f''' and the dimension {match.strip()}'''
+            raise Exception("{}".format(error_text))
+        elif "The metric" in error and "does not have the provided time grain" in error and "defined in the metric definition." in error:
+            pattern = re.compile(r"The metric(.*?)defined in the metric definition.")
+            matches = pattern.findall(error)
+            error_text = ''
+            for index, match in enumerate(matches):
+                if index == 0:
+                    error_text += f'''The metric {match.strip()} defined in the metric definition'''
+                else:
+                    error_text += f''' and the metric {match.strip()} defined in the metric definition'''
+            raise Exception("{}".format(error_text))
+        else:
+            raise Exception("{}".format(error))
+    sql_compiled = parsed_response["compiled_code"]
+    
+    for comment in re.findall("((?=--).+.(?=\\n))", sql_compiled):
+        sql_compiled = sql_compiled.replace(comment, "")
+    
+    sql_compiled = sql_compiled.replace("\n", "")
+    sql_compiled = re.sub(" +", " ", sql_compiled)
+    sql = sql_compiled[:]
+       
+    if time_grain == 'all_time':
+        replace_value = f"""{", ".join([metric.lower() for metric in context['metrics']] + dbt_columns)}"""
+    else:
+        replace_value = f"""date_{time_grain} as date, {", ".join([metric for metric in list(set(context['metrics'] + orderby_metrics))] + dbt_columns)}"""
+   
+    sql = sql.replace("*", replace_value, 1)
+
+    if orderby_text != None and DBT_SERVER:
+        sql += " order by " + orderby_text
+
+    return sql
+class CustomTemplateProcessor(BaseTemplateProcessor):
+    """A custom presto template processor."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.table_name = "metrics"
+        self.dbt_cloud = DBT_CLOUD
+
+    def process_custom_parsed_query(self, rendered_query) -> str:
+
+        rendered_query = rendered_query.replace("<<", "{{").replace(">>", "}}")
+
+        return rendered_query
+
+    def process_template(self, sql: str, **kwargs) -> str:
+        """Processes a sql template with $ style macro using regex."""
+        # Add custom macros functions.
+        macros = {}  # type: Dict[str, Any]
+        # Update with macros defined in context and kwargs.
+        print("=======================CONTEXT=======================")
+        print(self._context)
+        if self._context.get("table_name") == "metrics":
+            DBT_METRIC = dbt_metric(self._context)
+            if DBT_METRIC:
+                macros["DBT_METRIC"] = DBT_METRIC
+        template = self.env.from_string(sql)
+        macros.update(self._context)
+        macros.update(kwargs)
+
+        context = validate_template_context(self.engine, macros)
+        return template.render(context)
+
+
+CUSTOM_TEMPLATE_PROCESSORS = {
+    db_engine_spec: CustomTemplateProcessor
+}
+#==============================================================================
+
+
+
 
 # Roles that are controlled by the API / Superset and should not be changed
 # by humans.
