@@ -1348,6 +1348,25 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
     ) -> list[Any]:
         # denormalize column name before querying for values
         # unless disabled in the dataset configuration
+        def make_request_with_dimension(dimension):
+            import requests
+            import os
+            client_name = os.environ.get("SAIVO_Saivodemo_RETOOL_ALIAS")
+            client_secret = os.environ.get("SAIVO_Saivodemo_RETOOL_SECRET")
+
+            url = "https://app.saivo.com/dimension_values"
+
+            params = {
+                "client_name": client_name,
+                "client_secret": client_secret,
+                "dimension": dimension
+            }
+
+            response = requests.get(url, params=params)
+            data = None
+            if response.status_code == 200:
+                data = response.json()
+            return data
         db_dialect = self.database.get_dialect()
         column_name_ = (
             self.database.db_engine_spec.denormalize_name(db_dialect, column_name)
@@ -1355,7 +1374,11 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             else column_name
         )
         cols = {col.column_name: col for col in self.columns}
-        target_col = cols[column_name_]
+        # target_col = cols[column_name_]
+        try:
+            target_col = cols[column_name_]
+        except Exception:
+            target_col = cols[column_name_.lower()]
         tp = self.get_template_processor()
         tbl, cte = self.get_from_clause(tp)
 
@@ -1384,7 +1407,13 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             # pylint: disable=protected-access
             if engine.dialect.identifier_preparer._double_percents:
                 sql = sql.replace("%%", "%")
-
+            
+            saivo_query = None
+            if "DBT_METRIC" in str(tbl):
+                saivo_query = make_request_with_dimension(column_name)
+            if saivo_query:
+                sql = sql.replace(r'{{ DBT_METRIC }}', saivo_query)
+            
             df = pd.read_sql_query(sql=sql, con=engine)
             # replace NaN with None to ensure it can be serialized to JSON
             df = df.replace({np.nan: None})
