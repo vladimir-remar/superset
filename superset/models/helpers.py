@@ -1346,6 +1346,50 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         limit: int = 10000,
         denormalize_column: bool = False,
     ) -> list[Any]:
+        def get_dbt_compiled_query_from_saivo_backend(column_name) -> str:
+            """Get the dbt compiled query."""
+            import requests
+            import os
+            client_name = os.getenv("CLIENT_NAME")
+            db_engine_spec = os.getenv("db_engine_spec")
+            context = {
+                "columns": [],
+                "from_dttm": None,
+                "groupby": None,
+                "metrics": [],
+                "row_limit": 1000,
+                "row_offset": 0,
+                "time_column": None,
+                "time_grain": None,
+                "to_dttm": None,
+                "table_columns": [],
+                "filter": [],
+                "is_timeseries": False,
+                "is_rowcount": False,
+                "inner_from_dttm": None,
+                "inner_to_dttm": None,
+                "series_limit": 0,
+                "series_limit_metric": None,
+                "timeseries_limit": None,
+                "timeseries_limit_metric": None,
+                "extras": {"where": "", "having": ""},
+                "table_name": "dbt_semantic_layer",
+                "orderby": [],
+                "database_id": 1,
+                "dttm_columns": [],
+                "db_engine_spec": None,
+            }
+            context["columns"] = [column_name]
+            context["db_engine_spec"] = db_engine_spec
+            
+            url = f"https://superset-dbt-sl.saivo.com/{client_name}/compile_sql"
+            response = requests.post(url, json=context)
+            data_parsed = response.json()
+            sql = data_parsed.get("sql")
+            response_type = data_parsed.get("response_type")
+            if response.status_code == 500:
+                raise Exception("{}".format(sql))
+            return sql
         # denormalize column name before querying for values
         # unless disabled in the dataset configuration
         db_dialect = self.database.get_dialect()
@@ -1355,7 +1399,11 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             else column_name
         )
         cols = {col.column_name: col for col in self.columns}
-        target_col = cols[column_name_]
+        # target_col = cols[column_name_]
+        try:
+            target_col = cols[column_name_]
+        except Exception:
+            target_col = cols[column_name_.lower()]
         tp = self.get_template_processor()
         tbl, cte = self.get_from_clause(tp)
 
@@ -1384,7 +1432,12 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             # pylint: disable=protected-access
             if engine.dialect.identifier_preparer._double_percents:
                 sql = sql.replace("%%", "%")
-
+            
+            saivo_query = None
+            if "DBT_METRIC" in str(tbl):
+                saivo_query = get_dbt_compiled_query_from_saivo_backend(column_name)
+            if saivo_query:
+                sql = sql.replace(r'{{ DBT_METRIC }}', saivo_query)
             df = pd.read_sql_query(sql=sql, con=engine)
             # replace NaN with None to ensure it can be serialized to JSON
             df = df.replace({np.nan: None})
