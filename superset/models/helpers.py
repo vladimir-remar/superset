@@ -1351,8 +1351,10 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         def make_request_with_dimension(dimension):
             import requests
             import os
-            client_name = os.environ.get("SAIVO_Saivodemo_RETOOL_ALIAS")
-            client_secret = os.environ.get("SAIVO_Saivodemo_RETOOL_SECRET")
+            
+            retool_name = os.environ.get("RETOOL_NAME")
+            client_name = os.environ.get(f"SAIVO_{retool_name}_RETOOL_ALIAS")
+            client_secret = os.environ.get(f"SAIVO_{retool_name}_RETOOL_SECRET")
 
             url = "https://app.saivo.com/dimension_values"
 
