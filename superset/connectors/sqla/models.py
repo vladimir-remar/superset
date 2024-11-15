@@ -1458,7 +1458,7 @@ class SqlaTable(
         return get_template_processor(table=self, database=self.database, **kwargs)
 
     def get_query_str(self, query_obj: QueryObjectDict) -> str:
-        query_str_ext = self.get_query_str_extended(query_obj)
+        query_str_ext = self.get_query_str_extended(query_obj, table=self.table_name)
         all_queries = query_str_ext.prequeries + [query_str_ext.sql]
         return ";\n\n".join(all_queries) + ";"
 
@@ -1726,7 +1726,7 @@ class SqlaTable(
 
     def query(self, query_obj: QueryObjectDict) -> QueryResult:
         qry_start_dttm = datetime.now()
-        query_str_ext = self.get_query_str_extended(query_obj)
+        query_str_ext = self.get_query_str_extended(query_obj, table=self.table_name)
         sql = query_str_ext.sql
         status = QueryStatus.SUCCESS
         errors = None
@@ -2018,7 +2018,7 @@ class SqlaTable(
         """
         extra_cache_keys = super().get_extra_cache_keys(query_obj)
         if self.has_extra_cache_key_calls(query_obj):
-            sqla_query = self.get_sqla_query(**query_obj)
+            sqla_query = self.get_sqla_query(**query_obj, table_name=self.table_name)
             extra_cache_keys += sqla_query.extra_cache_keys
         return list(set(extra_cache_keys))
 
