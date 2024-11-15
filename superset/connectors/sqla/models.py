@@ -1458,7 +1458,7 @@ class SqlaTable(
         return get_template_processor(table=self, database=self.database, **kwargs)
 
     def get_query_str(self, query_obj: QueryObjectDict) -> str:
-        query_str_ext = self.get_query_str_extended(query_obj)
+        query_str_ext = self.get_query_str_extended(query_obj, table_name=self.table_name)
         all_queries = query_str_ext.prequeries + [query_str_ext.sql]
         return ";\n\n".join(all_queries) + ";"
 
@@ -1726,7 +1726,7 @@ class SqlaTable(
 
     def query(self, query_obj: QueryObjectDict) -> QueryResult:
         qry_start_dttm = datetime.now()
-        query_str_ext = self.get_query_str_extended(query_obj)
+        query_str_ext = self.get_query_str_extended(query_obj, table_name=self.table_name)
         sql = query_str_ext.sql
         status = QueryStatus.SUCCESS
         errors = None

@@ -25,7 +25,7 @@ import uuid
 from collections.abc import Hashable
 from datetime import datetime, timedelta
 from typing import Any, cast, NamedTuple, Optional, TYPE_CHECKING, Union
-
+import copy as python_copy
 import dateutil.parser
 import humanize
 import numpy as np
@@ -50,7 +50,7 @@ from sqlalchemy.sql.elements import ColumnElement, literal_column, TextClause
 from sqlalchemy.sql.expression import Label, Select, TextAsFrom
 from sqlalchemy.sql.selectable import Alias, TableClause
 from sqlalchemy_utils import UUIDType
-
+from sqlalchemy import nullslast
 from superset import app, db, is_feature_enabled
 from superset.advanced_data_type.types import AdvancedDataTypeResponse
 from superset.common.db_query_status import QueryStatus
@@ -876,8 +876,10 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         self,
         query_obj: QueryObjectDict,
         mutate: bool = True,
+        **kwargs: Any,
     ) -> QueryStringExtended:
-        sqlaq = self.get_sqla_query(**query_obj)
+        table_name = kwargs.get("table_name")
+        sqlaq = self.get_sqla_query(**query_obj, table_name=table_name)
         sql = self.database.compile_sqla_query(sqlaq.sqla_query)
         sql = self._apply_cte(sql, sqlaq.cte)
 
@@ -1329,6 +1331,27 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
     ) -> list[Any]:
         # denormalize column name before querying for values
         # unless disabled in the dataset configuration
+        def make_request_with_dimension(dimension):
+            import requests
+            import os
+
+            retool_name = os.environ.get("RETOOL_NAME")
+            client_name = os.environ.get(f"SAIVO_{retool_name}_RETOOL_ALIAS")
+            client_secret = os.environ.get(f"SAIVO_{retool_name}_RETOOL_SECRET")
+
+            url = "https://app.saivo.com/dimension_values"
+
+            params = {
+                "client_name": client_name,
+                "client_secret": client_secret,
+                "dimension": dimension
+            }
+
+            response = requests.get(url, params=params)
+            data = None
+            if response.status_code == 200:
+                data = response.json()
+            return data
         db_dialect = self.database.get_dialect()
         column_name_ = (
             self.database.db_engine_spec.denormalize_name(db_dialect, column_name)
@@ -1336,7 +1359,12 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             else column_name
         )
         cols = {col.column_name: col for col in self.columns}
-        target_col = cols[column_name_]
+        # target_col = cols[column_name_]
+        try:
+            target_col = cols[column_name_]
+        except Exception:
+            target_col = cols[column_name_.lower()]
+
         tp = self.get_template_processor()
         tbl, cte = self.get_from_clause(tp)
 
@@ -1369,6 +1397,11 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             if engine.dialect.identifier_preparer._double_percents:
                 sql = sql.replace("%%", "%")
 
+            saivo_query = None
+            if "DBT_METRIC" in str(tbl):
+                saivo_query = make_request_with_dimension(column_name)
+            if saivo_query:
+                sql = sql.replace(r'{{ DBT_METRIC }}', saivo_query)
             df = pd.read_sql_query(sql=sql, con=engine)
             # replace NaN with None to ensure it can be serialized to JSON
             df = df.replace({np.nan: None})
@@ -1448,6 +1481,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         timeseries_limit: Optional[int] = None,
         timeseries_limit_metric: Optional[Metric] = None,
         time_shift: Optional[str] = None,
+        **kwargs: Any,
     ) -> SqlaQuery:
         """Querying any sqla table from this common interface"""
         if granularity not in self.dttm_cols and granularity is not None:
@@ -1455,6 +1489,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
 
         extras = extras or {}
         time_grain = extras.get("time_grain_sqla")
+        table_name = kwargs.get("table_name")
 
         template_kwargs = {
             "columns": columns,
@@ -1468,6 +1503,18 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             "to_dttm": to_dttm.isoformat() if to_dttm else None,
             "table_columns": [col.column_name for col in self.columns],
             "filter": filter,
+            "is_timeseries": is_timeseries,
+            "is_rowcount": is_rowcount,
+            "inner_from_dttm": inner_from_dttm,
+            "inner_to_dttm": inner_to_dttm,
+            "series_limit": series_limit,
+            "series_limit_metric": series_limit_metric,
+            "timeseries_limit": timeseries_limit,
+            "timeseries_limit_metric": timeseries_limit_metric,
+            "extras": extras,
+            "table_name": table_name,
+            "orderby": orderby,
+            "database_id": self.database_id,
         }
         columns = columns or []
         groupby = groupby or []
@@ -1955,14 +2002,15 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                 )
                 having_clause_and += [self.text(having)]
 
-        if apply_fetch_values_predicate and self.fetch_values_predicate:
-            qry = qry.where(
-                self.get_fetch_values_predicate(template_processor=template_processor)
-            )
-        if granularity:
-            qry = qry.where(and_(*(time_filters + where_clause_and)))
-        else:
-            qry = qry.where(and_(*where_clause_and))
+        if table_name != "metrics":
+            if apply_fetch_values_predicate and self.fetch_values_predicate:
+                qry = qry.where(
+                    self.get_fetch_values_predicate(template_processor=template_processor)
+                )
+            if granularity:
+                qry = qry.where(and_(*(time_filters + where_clause_and)))
+            else:
+                qry = qry.where(and_(*where_clause_and))
         qry = qry.having(and_(*having_clause_and))
 
         self.make_orderby_compatible(select_exprs, orderby_exprs)
@@ -1982,7 +2030,12 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     quote = engine.dialect.identifier_preparer.quote
                     col = literal_column(quote(col.name))
             direction = sa.asc if ascending else sa.desc
-            qry = qry.order_by(direction(col))
+            # qry = qry.order_by(direction(col))
+            if self.db_engine_spec.engine.lower() == "bigquery":
+                if table_name != "metrics":
+                     qry = qry.order_by(nullslast(direction(col)))
+            else:
+                qry = qry.order_by(nullslast(direction(col)))
 
         if row_limit:
             qry = qry.limit(row_limit)
@@ -2005,7 +2058,16 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     inner_select_exprs.append(inner)
 
                 inner_select_exprs += [inner_main_metric_expr]
-                subq = sa.select(inner_select_exprs).select_from(tbl)
+                # subq = sa.select(inner_select_exprs).select_from(tbl)
+                if table_name == 'metrics':
+                    sl_template_kwargs = python_copy.deepcopy(template_kwargs)
+                    sl_template_kwargs['has_series_limit'] = True
+                    template_processor_tmp_sl = self.get_template_processor(**sl_template_kwargs)
+                    tbl_sl, cte_sl = self.get_from_clause(template_processor_tmp_sl)
+
+                    subq = sa.select(inner_select_exprs).select_from(tbl_sl)
+                else:
+                    subq = sa.select(inner_select_exprs).select_from(tbl)
                 inner_time_filter = []
 
                 if dttm_col and not db_engine_spec.time_groupby_inline:
@@ -2017,7 +2079,9 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                             template_processor=template_processor,
                         )
                     ]
-                subq = subq.where(and_(*(where_clause_and + inner_time_filter)))
+                # subq = subq.where(and_(*(where_clause_and + inner_time_filter)))
+                if table_name != 'metrics':
+                    subq = subq.where(and_(*(where_clause_and + inner_time_filter)))
                 subq = subq.group_by(*inner_groupby_exprs)
 
                 ob = inner_main_metric_expr
@@ -2081,7 +2145,9 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                 top_groups = self._get_top_groups(
                     result.df, dimensions, groupby_series_columns, columns_by_name
                 )
-                qry = qry.where(top_groups)
+                # qry = qry.where(top_groups)
+                if table_name != 'metrics':
+                    qry = qry.where(top_groups)
 
         qry = qry.select_from(tbl)
 
