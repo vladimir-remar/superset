@@ -1052,12 +1052,18 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                         msg=ex.message,
                     )
                 ) from ex
+        table_name_property = None
+        if template_processor:
+            table_name_property = getattr(template_processor, "table_name", None)
 
-        script = SQLScript(sql, engine=self.db_engine_spec.engine)
-        if len(script.statements) > 1:
-            raise QueryObjectValidationError(
-                _("Virtual dataset query cannot consist of multiple statements")
-            )
+        if table_name_property is not None and table_name_property == 'metrics':
+            sql = sqlparse.format(sql.strip("\t\r\n; "), strip_comments=True)
+        else:
+            script = SQLScript(sql, engine=self.db_engine_spec.engine)
+            if len(script.statements) > 1:
+                raise QueryObjectValidationError(
+                    _("Virtual dataset query cannot consist of multiple statements")
+                )
 
         if not sql:
             raise QueryObjectValidationError(_("Virtual dataset query cannot be empty"))
